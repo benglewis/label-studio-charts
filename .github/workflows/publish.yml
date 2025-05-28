@@ -21,8 +21,6 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4.2.2
-        with:
-          fetch-depth: '2'
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
