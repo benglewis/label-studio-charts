@@ -1,24 +1,21 @@
-name: "Upload Chart"
+name: "Upload Chart benglewis"
 
 on:
   push:
     branches:
-      - master
+      - benglewis
     paths:
       - 'heartex/**'
       - '.github/workflows/publish.yml'
-
-env:
-  HELM_CHARTS_BUCKET: "heartex-charts"
-  HELM_CHARTS_REPO: "https://charts.heartex.com"
-  SYNC_DIR: sync
-  INDEX_DIR: index
-  AWS_REGION: us-east-1
 
 jobs:
   upload_chart:
     name: "Upload Chart"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
     steps:
       - uses: hmarr/debug-action@v3.0.0
 
@@ -26,6 +23,15 @@ jobs:
         uses: actions/checkout@v4.2.2
         with:
           fetch-depth: '2'
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
 
       - name: Helm package
         id: helm_package
@@ -45,34 +51,37 @@ jobs:
           echo "${CHANGED_CHARTS_MAP}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.CHARTS_UPLOAD_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.CHARTS_UPLOAD_AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
       - name: Build helm index
         id: helm_index
         run: |
           set -eux
-          aws s3 cp s3://${{ env.HELM_CHARTS_BUCKET }}/index.yaml "${{ env.INDEX_DIR }}/index.yaml" || true
           helm repo index ${{ env.SYNC_DIR }} --url "${{ env.HELM_CHARTS_REPO }}" --merge "${{ env.INDEX_DIR }}/index.yaml"
           echo "==> Merged index:"
           cat "${{ env.SYNC_DIR }}/index.yaml"
 
-      - name: Publish to S3
-        run: |
-          set -eux
-          aws s3 cp ${{ env.SYNC_DIR }} s3://${{ env.HELM_CHARTS_BUCKET }}/ --recursive
-          # Make sure index.yaml is synced last
-          aws s3 cp "${{ env.SYNC_DIR }}/index.yaml" s3://${{ env.HELM_CHARTS_BUCKET }}/
-
-      - name: Post to a Slack channel
-        id: slack
-        uses: slackapi/slack-github-action@v1.27
+      - name: Run chart-releaser
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
         with:
-          channel-id: 'C02LMULF4NA'
-          slack-message: "New versions of helm charts released:\n${{ env.CHANGED_CHARTS_MAP }}<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|[Workflow run]>"
+          charts_dir: charts
+          config: cr.yaml
         env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and Sign OCI Charts
+        run: |
+          for chart in `find .cr-release-packages -name '*.tgz' -print`; do
+            helm push ${chart} oci://ghcr.io/${GITHUB_REPOSITORY} |& tee helm-push-output.log
+            file_name=${chart##*/}
+            chart_name=${file_name%-*}
+            digest=$(awk -F "[, ]+" '/Digest/{print $NF}' < helm-push-output.log)
+            cosign sign "ghcr.io/${GITHUB_REPOSITORY}/${chart_name}@${digest}"
+          done
+        env:
+          COSIGN_YES: true
